@@ -16,6 +16,18 @@ A proof-of-concept dashboard where you ask a question in plain language, such as
 
 ---
 
+## Screenshots
+
+**Question and answer.** The agent's explanation is on the left. The live **Execution Log** on the right shows every LLM decision, API call and model-training step.
+
+![Question and answer with the Execution Log](docs/question.png)
+
+**Results.** Metric tiles (Pearson r, Spearman ρ, p-value, n, best lag, out-of-sample R²) and interactive charts: time series, scatter, lag scan, forecast, and the raw data.
+
+![Metric tiles, charts and Execution Log](docs/answer.png)
+
+---
+
 ## Quick start
 
 ```bash
@@ -41,6 +53,7 @@ streamlit run app.py
 docker build -t corr-agent .
 docker run -p 8501:8501 --env-file .env corr-agent      # → http://localhost:8501
 ```
+> **Write the keys in `.env` without quotes** (`GEMINI_API_KEY=abc…`, not `"abc…"`). Docker's `--env-file` passes values literally, so quotes would become part of the key and the provider rejects it. Running without Docker strips quotes, so this only shows up in the container.
 
 **Local LLM instead of Gemini:** install [Ollama](https://ollama.com), run `ollama pull qwen2.5:7b` and choose *Ollama* in the sidebar. Docker reaches the host's Ollama through `host.docker.internal`.
 
@@ -158,6 +171,86 @@ Making it robust, especially for small local models:
 
 ---
 
+## Model comparison (benchmark)
+
+[`benchmarks/run_benchmark.py`](benchmarks/run_benchmark.py) asks every model the same three questions, through the same agent, tools and prompt. Each run records the tool calls, errors, token usage and wall-clock time. The raw results, including every full answer, are in [`benchmarks/results.jsonl`](benchmarks/results.jsonl). The benchmark was run on 2026-10-14 using free-tier keys, one run at a time.
+
+| Case | Question | What it tests |
+|---|---|---|
+| **A** | Do hot days in New York drive interest in ice cream? Forecast next week. | Full pipeline: weather + Wikipedia + forecast |
+| **B** | Do oil prices drive US gasoline prices? Is there a lag? | FRED series search, daily-vs-weekly alignment, lag scan |
+| **C** | Do high pollen days in Berlin increase sales of allergy medication? | **Unavailable data:** no sales source exists, so the agent must decline or clearly label a proxy |
+
+| Model (provider) | A | B | C | LLM calls / question | Tokens in / out | Time / question |
+|---|---|---|---|---|---|---|
+| `gemini-3.5-flash-lite` (Gemini) | ✅ | ✅ r = 0.94, weekly, ~10 y | ✅ declined after searching | 5.0 | 14,957 / 552 | **8 s** |
+| `gpt-oss-20b` (Groq) | ❌ **invented forecast** | ✅ r = 0.94, monthly | ✅ declined | 5.3 | 11,893 / 632 | 53 s¹ |
+| `gpt-oss-120b` (Groq) | ✅ | ✅ r = 0.77, 2-week lag, 1 y | ✅ declined | 4.3 | 10,510 / 570 | 40 s¹ |
+| `qwen3.8-27b` (Groq, preview) | ✅ | ✅ r = 0.90, daily wholesale | ✅ proxy, clearly labelled | 4.0 | 13,860 / 967 | 61 s¹ |
+| `qwen2.5:7b` (Ollama, local CPU) | ⚠️ ran, 3-year window, r = −0.06 | ⛔ timed out (stopped after 28 min) | ⛔ timed out (stopped after 16 min) | 7.0 (A) | 18,042 / 652 (A) | 7 min (A)² |
+| `gemini-3.5-flash`, `gemini-3.6-flash` | ⛔ | ⛔ | ⛔ | – | – | – |
+
+¹ Groq's actual inference speed is far higher. These times are dominated by waits and retries forced by the free tier's limit of **8k tokens per minute**, which is less than a single question needs.
+² Intel i9-8950HK laptop, CPU only: Ollama has no GPU acceleration on Intel Macs.
+
+**Findings**
+- **The fastest and most reliable model was `gemini-3.5-flash-lite`.** It solved all three cases with no tool errors, in about 8 s each. It's the default.
+- **Hallucination after a tool error (gpt-oss-20b, case A).** It passed the forecast dataset as X, got an error, and never produced a forecast. It then wrote a forecast table anyway, with **invented** daily temperatures (14.9, 15.2, 15.5 … °C in steps of exactly +0.3) and predictions it computed itself. The answer looks fully plausible. Tools returning errors as data let models recover, but nothing *verifies* that the numbers in an answer came from a tool (see Limitations).
+- **The LLM's choices change the statistics.** On the same oil → gasoline question, the 10-year weekly window gave r = 0.94 and no lag. A 1-year window of the same series gave r = 0.77 with a 2-week lag. Different series (monthly retail, daily wholesale) gave other values again. For ice cream, the local model picked a 3-year window instead of the instructed 365 days and found no correlation. The Execution Log shows every argument, so these choices can be checked.
+- **Unavailable data was handled honestly by every cloud model.** Three declined; `qwen3.8-27b` used Wikipedia views of *Antihistaminikum* as a stand-in and said so explicitly.
+- **Availability is part of the picture.** The larger Gemini models returned `503 UNAVAILABLE` ("high demand") and then `429 RESOURCE_EXHAUSTED` (free-tier quota) on every run. In production this calls for a fallback chain, see Scaling.
+- **A local 7B model works, but not on this hardware.** `qwen2.5:7b` called the tools correctly but needed about 7 minutes for case A. Cases B and C were stopped after 28 and 16 minutes without an answer: each step re-reads the growing conversation (tool schemas plus search results), which is slow on a CPU.
+
+---
+
+## Cost
+
+All prices are converted at the ECB reference rate of 2026-10-13, **1 USD = €0.8938**. Token counts are the **measured** averages from the benchmark above.
+
+### LLM cost per question
+
+Each question takes 4–7 LLM calls. **Input tokens dominate** (about 10–19k per question against 0.5–1k output), because every call re-sends the system prompt, all tool schemas and the growing history.
+
+| Model | Price per 1M tokens (in / out) | € per question | € per 1,000 questions | € per 100,000 questions |
+|---|---|---|---|---|
+| `gemini-3.5-flash-lite` | €0.27 / €2.24 | €0.0052 | €5.24 | €524 |
+| `gpt-oss-20b` (Groq) | €0.07 / €0.27 | €0.0010 | €0.97 | €97 |
+| `gpt-oss-120b` (Groq) | €0.13 / €0.54 | €0.0017 | €1.71 | €171 |
+| `qwen3.8-27b` (Groq, preview) | €0.72 / €3.58 | €0.0134 | €13.37 | €1,337 |
+| `qwen2.5:7b` (Ollama) | €0 | €0 | €0 | hardware instead: a GPU server is needed for usable latency |
+
+**Free tiers** are fine for development, but not for a demo with several users or for production:
+- Groq's free tier allows 8k tokens per minute, less than one question uses.
+- The larger Gemini models were not usable on the free tier at all.
+- `gemini-3.5-flash-lite` is free of charge within its free-tier request limits.
+
+### Data APIs
+
+| API | Cost | Limits / conditions |
+|---|---|---|
+| Open-Meteo | Free for **non-commercial** use | 600/min, 5,000/h, 10,000/day, 300,000/month. Commercial "Standard" plan: about **$29 ≈ €26 per month for 1M calls** (per Open-Meteo's announcement) |
+| Wikimedia Pageviews | Free | Descriptive User-Agent required. Documented ceiling of about 200 requests/s, with HTTP 429 seen in practice well below that |
+| FRED | Free (API key) | No fixed published limit. Must show the "not endorsed by the Federal Reserve" notice, and some third-party series need the owner's permission |
+
+A question makes about 3–5 data API calls, so **100,000 questions/month ≈ 300–500k calls.** That's within one Open-Meteo Standard plan (≈ €26/month). Wikipedia and FRED stay free.
+
+### Total, 100,000 questions/month (rough estimate)
+
+| Setup | LLM | Data APIs | ≈ Total |
+|---|---|---|---|
+| `gemini-3.5-flash-lite` (default) | €524 | €26 | **≈ €550 / month** |
+| `gpt-oss-20b` on a paid Groq tier | €97 | €26 | **≈ €125 / month** (but see the hallucination finding) |
+
+Hosting (the app, workers, Redis, Postgres) comes on top. It's small at this volume compared with the LLM cost.
+
+### How to bring the cost down
+1. **Prompt caching** for the static system prompt and tool schemas, which make up most of the input tokens.
+2. **Result caching:** the same normalized question and tool plan returns the cached analysis, with no LLM call and no API calls.
+3. **Model tiering:** a cheap model for the tool-calling steps, a stronger one only for the final explanation.
+4. **Fewer tool schemas per call:** only offer the tools relevant to the question, e.g. with LangChain's `LLMToolSelectorMiddleware`.
+
+---
+
 ## Scaling to production
 
 This PoC keeps everything inside one Streamlit process. With heavy traffic I would split it like this:
@@ -184,9 +277,63 @@ flowchart LR
 6. **Safety and quality.** Set per-user cost and step budgets (the agent's recursion limit is a first version of this; LangChain's `ToolCallLimitMiddleware` would add per-tool caps), validate tool arguments, and keep an evaluation set of questions with expected tool plans, run in CI.
 7. **Observability.** Use LangSmith or OpenTelemetry traces for every LLM and tool call, metrics (latency, tokens, cost, tool error rate, cache hit rate), and structured logs.
 
+### The real bottleneck: LLM capacity, not servers
+The benchmark shows where heavy traffic would break first. It's the **LLM provider's quota**: Groq's free tier allows 8k tokens per minute while one question needs 10–19k, and the larger Gemini models answered `503`/`429` on every run. More workers don't help with that. What does help:
+- **paid tiers or reserved throughput** with the providers,
+- **several providers behind the gateway**, so that when one is saturated or down, requests move to another (`with_fallbacks()`),
+- **result caching**, so that repeated questions use no LLM capacity at all,
+- **fewer tokens per question** (prompt caching, fewer tool schemas per call), which also means more questions per unit of quota.
+
+The data APIs are a secondary bottleneck, handled by the cache and the rate limiters described above.
+
+### Compliance & security (EU)
+**GDPR**
+- The open data itself (weather, aggregated pageviews, economic series) contains no personal data. But **user questions, chat history, logs and traces can**, so they fall under the GDPR.
+- **Each question is sent to an external LLM provider**, which acts as a processor, possibly outside the EU. This requires:
+  - a data processing agreement (DPA) with each provider,
+  - a legal basis for any transfer outside the EU (EU-US Data Privacy Framework or standard contractual clauses),
+  - **paid tiers only**. On free tiers, providers may use prompts to improve their products.
+- **Data minimisation and retention:** no raw prompts in long-term logs, defined deletion periods for chat history and traces, and support for access and deletion requests. A privacy notice should name the LLM providers.
+- **Data residency option:** a self-hosted open model (e.g. vLLM in an EU region) keeps all prompts inside the EU. The Ollama provider in this PoC shows that the agent already works with open models.
+
+**EU AI Act (Regulation (EU) 2024/1689)**
+- **Risk category:** this system is **not high-risk**. It isn't used in any of the Annex III areas (employment, credit, education, law enforcement, …), so the high-risk obligations don't apply.
+- **Transparency (Article 50):** users must know they are interacting with an AI system. AI-generated text published to inform the public must be marked as such. The dashboard states that answers are AI-generated.
+- **Model obligations:** the obligations for general-purpose AI models sit with the model providers (Google, OpenAI/Alibaba via Groq), as long as we only use the models and don't substantially modify them.
+- **AI literacy (Article 4):** staff who operate the system need appropriate AI literacy.
+- **Timelines:** parts of the AI Act timeline have been under revision, so the applicable dates should be checked at deployment time.
+
+**Security**
+- **Secrets:** API keys in a secret manager (e.g. Vault or a cloud secret manager), not in `.env` files, and rotated regularly.
+- **Access:** per-user authentication, quotas and cost budgets, to prevent abuse and runaway LLM spending.
+- **Prompt injection:** tool results such as Wikipedia descriptions and search results are untrusted text that enters the model's context. The risk is limited because all tools are read-only, but tool output should be treated as data, never as instructions, and logged.
+- **Licences and attribution:** Open-Meteo data is CC BY 4.0 and needs attribution. FRED requires its "not endorsed by the Federal Reserve" notice. Wikimedia requires a descriptive User-Agent.
+
 ---
 
 ## Limitations and honest caveats
-- **Correlation is not causation.** Many strong results here, such as temperature vs. "Ice cream", come largely from **shared seasonality**. The agent is instructed to say so. A natural next step would be to also correlate detrended or differenced series.
+
+These are known, documented weak spots. The code was frozen for the benchmark, so they're listed together with the fix I would make next.
+
+**Agent and LLM**
+
+| Weak spot | Evidence | Next step |
+|---|---|---|
+| Nothing *verifies* that numbers in the answer come from a tool; the system prompt is the only barrier | `gpt-oss-20b` invented a forecast (benchmark, case A) | A code check: if the answer contains statistics or a forecast that no tool returned, show a "not backed by data" warning |
+| Passing a forecast dataset as X gives a vague "0 overlapping days" error | Same run | A clearer error that says to pass it as `forecast_dataset_id` |
+| Small models deviate from instructions (time window, extra tool calls, guessed dataset ids) | `qwen2.5:7b`: 3-year window, unrequested searches, guessed ids that it then corrected | Enforce defaults in the tools rather than in the prompt |
+| No provider fallback | Larger Gemini models: 503/429 on every run | `with_fallbacks()` to a second provider |
+
+**Statistics and ML**
+
+| Weak spot | Effect | Next step |
+|---|---|---|
+| Neighbouring days are not independent (autocorrelation) | p-values are too optimistic | Confidence intervals that account for this (effective sample size or block bootstrap) |
+| Shared seasonality | Inflates r (temperature vs. ice cream) | Also correlate detrended or differenced series |
+| Only one input feature; random forests can't predict beyond the training range | Forecasts ignore Y's own recent level. The forest scores badly whenever the test period goes beyond the training range (oil → gasoline: r = 0.94 but forest R² < 0) | Add Y's recent values and day of week as inputs; show a prediction interval |
+| Several tests per question (15 lags; Pearson or Spearman) | Slightly more false "significant" results | Correct for multiple tests, or report the p-value only at lag 0 |
+
+**Data and runtime**
 - **Data coverage.** English Wikipedia is read worldwide, so local questions work better with a local-language edition. Pollen data covers only Europe. FRED is mostly US data. ERA5 weather lags real time by about 5 days.
-- **Small local models** sometimes skip steps or stop early. Gemini is the more reliable default.
+- **Wikipedia views are a proxy for interest,** not for sales, illness or behaviour. The agent is told to label proxies as such.
+- **Local inference** on a CPU-only laptop takes minutes per question. Ollama is the offline option, Gemini the default.
