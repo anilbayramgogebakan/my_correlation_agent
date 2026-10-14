@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.env
+.venv/
+.pytest_cache/
+.DS_Store
+
+# Local config from another project (contains a credential) — never commit
+ex_config.toml
+
+# Company task description — not published
+assignment.txt
