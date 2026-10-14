@@ -55,7 +55,7 @@ docker run -p 8501:8501 --env-file .env corr-agent      # → http://localhost:8
 ```
 > **Write the keys in `.env` without quotes** (`GEMINI_API_KEY=abc…`, not `"abc…"`). Docker's `--env-file` passes values literally, so quotes would become part of the key and the provider rejects it. Running without Docker strips quotes, so this only shows up in the container.
 
-**Local LLM instead of Gemini:** install [Ollama](https://ollama.com), run `ollama pull qwen2.5:7b` and choose *Ollama* in the sidebar. Docker reaches the host's Ollama through `host.docker.internal`.
+**Local LLM instead of Gemini:** install [Ollama](https://ollama.com), run `ollama pull qwen2.5:7b` and choose *Ollama* in the sidebar. Docker reaches the host's Ollama through `host.docker.internal`, but only if Ollama listens on all interfaces (`OLLAMA_HOST=0.0.0.0 ollama serve`). By default it only accepts connections from `127.0.0.1`, so the container can't reach it. Note that listening on `0.0.0.0` also exposes Ollama to your local network.
 
 **CLI (no UI):**
 ```bash
