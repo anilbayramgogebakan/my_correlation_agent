@@ -102,7 +102,9 @@ corr_agent/
   charts.py                Plotly figures
   data_store.py            per-session datasets addressed by id
   clients/                 plain HTTP clients: open_meteo, wikimedia, fred, shared http (retry + cache)
-tests/
+tests/                     unit tests (clients with mocked HTTP, analysis, tools)
+benchmarks/                model benchmark runner + raw results (results.jsonl)
+docs/                      screenshots
 ```
 
 The code is split into layers, and each layer only knows about the one below it:
@@ -145,27 +147,42 @@ agent → runs the Python function → ToolMessage('{"dataset_id": "ds2", "n_poi
 LLM ← ToolMessage … (repeat) … → final AIMessage with the explanation
 ```
 
+**Why hand-written tools rather than tools generated from OpenAPI specs.** The tool schemas are JSON Schema, the same schema language OpenAPI uses, but they are curated by hand instead of generated from the APIs' OpenAPI descriptions (e.g. with LangChain's OpenAPI toolkit). Generated tools would expose every endpoint and parameter to the model: many more schema tokens on every call, and many more ways for a small model to go wrong. Eight task-level tools hide the API details: geocoding, unit conversion, redirect resolution and resampling happen inside the tool. The cost is that a new data source needs a small hand-written client and tool. An OpenAPI-generated layer is the natural extension if the number of sources grows.
+
 | Tool | API |
 |---|---|
 | `fetch_weather_history` | Open-Meteo geocoding + ERA5 archive (daily) |
 | `fetch_air_quality` | Open-Meteo air-quality (hourly → daily mean; pollen in Europe) |
 | `fetch_weather_forecast` | Open-Meteo forecast (≤ 16 days), the input for predictions |
-| `search_wikipedia_articles` | MediaWiki opensearch |
+| `search_wikipedia_articles` | MediaWiki full-text search with article descriptions, plus interlanguage links (English query → local-language article) |
 | `fetch_wikipedia_pageviews` | MediaWiki redirect resolution + Wikimedia REST pageviews |
 | `search_fred_series` / `fetch_fred_series` | FRED `series/search`, `series`, `series/observations` (only registered when a key is set) |
 | `run_correlation_analysis` | local: `analysis.py` |
 
 Making it robust, especially for small local models:
-- **Search before fetch.** The agent looks up exact Wikipedia titles and FRED series ids instead of guessing them.
+- **Search before fetch.** The agent looks up exact Wikipedia titles and FRED series ids instead of guessing them. Search results carry short descriptions, and an English query on a non-English edition also returns the linked local article (en *Skiing* → de *Skifahren*). An earlier title-prefix search led a 7B model to analyse a rapper called *Ski Aggu* instead of skiing.
 - **Redirects are resolved automatically.** Pageviews are counted per exact title, so the redirect `de:Heuschnupfen` shows about 2 views a day while its target `Allergische Rhinitis` holds the real traffic.
 - **Tools never raise.** Errors come back as `{"error": "..."}` tool results, so the model can fix its arguments and retry, and the Execution Log shows them.
 - **Inputs are validated** with clear messages (dates, frequencies, at least 10 overlapping points, constant series, a forecast variable that doesn't match X).
 - **A shared HTTP session** sends a descriptive User-Agent (Wikimedia requires one), retries with backoff on 429/5xx, and keeps a 1-hour in-memory response cache.
 - **The FRED API key is scrubbed** from any error text before it can reach the LLM or the UI.
 
+### Data processing pipeline
+1. **Ingestion:** each tool calls a thin client (`clients/`). All HTTP goes through one session with a descriptive User-Agent, retry with backoff on 429/5xx, and a 1-hour in-memory response cache.
+2. **Normalisation:** every source becomes the same shape, a float `pandas.Series` on a timezone-free daily `DatetimeIndex` with a frequency tag (D/B/W/M/Q/A) and units:
+   - hourly air-quality and pollen values are averaged per day,
+   - sunshine duration is converted from seconds to hours,
+   - days that Wikimedia omits (zero views) are filled with 0,
+   - FRED's `"."` missing values are dropped.
+3. **Storage:** series live in a per-session, in-memory `DatasetStore`. The LLM only sees a dataset id and summary statistics, and nothing is written to disk; the data disappears with the session.
+4. **Alignment:** both series are averaged to the coarser of their two frequencies and inner-joined on date. The analysis refuses to run with fewer than 10 overlapping points or a constant series.
+5. **Analysis and output:** `analysis.py` returns an `AnalysisResult`. A compact JSON summary goes to the LLM, and the full aligned data goes to the charts and the data table.
+
+The pipeline only handles public, aggregated data (weather, page-view counts, economic series). The one piece of potentially personal data is the user's question text, which is sent to the LLM provider (see *Compliance & security*).
+
 ### The analysis (`analysis.py`)
 - **Pearson r** (linear) and **Spearman ρ** (rank-based, robust to pageview spikes from news events), each with a p-value. The strength label comes from ρ.
-- **Lag scan:** Pearson r of `y_t` against `x_{t−k}` for k in [−7, 7]. A lag only counts as "best" if it beats lag 0 by more than 0.05.
+- **Lag scan:** Pearson r of `y_t` against `x_{t−k}` for k in [−7, 7] by default (the agent may widen it up to ±30, capped at a third of the series length). A lag only counts as "best" if it beats lag 0 by more than 0.05.
 - **Linear regression and a random forest**, scored with **out-of-sample R²** using `TimeSeriesSplit`, so the model never trains on the future. A negative R² means the relationship doesn't predict better than the mean.
 - **Forecast:** given a weather forecast for X, both models predict Y for the coming days.
 
@@ -173,7 +190,7 @@ Making it robust, especially for small local models:
 
 ## Model comparison (benchmark)
 
-[`benchmarks/run_benchmark.py`](benchmarks/run_benchmark.py) asks every model the same three questions, through the same agent, tools and prompt. Each run records the tool calls, errors, token usage and wall-clock time. The raw results, including every full answer, are in [`benchmarks/results.jsonl`](benchmarks/results.jsonl). The benchmark was run on 2026-10-14 using free-tier keys, one run at a time.
+[`benchmarks/run_benchmark.py`](benchmarks/run_benchmark.py) asks every model the same three questions, through the same agent, tools and prompt. Each run records the tool calls, errors, token usage and wall-clock time. The raw results, including every full answer, are in [`benchmarks/results.jsonl`](benchmarks/results.jsonl). The benchmark was run on 2026-10-14 using free-tier keys. Cloud runs went strictly one after another (5 s pauses for the `gemini-3.5-*` runs and `gpt-oss-20b` cases A–B, 60 s for all later runs), while the local Ollama runs ran in parallel on the CPU. Re-run it with `python -m benchmarks.run_benchmark` (all cloud models) or `--models ollama:qwen2.5:7b --cases A`.
 
 | Case | Question | What it tests |
 |---|---|---|
@@ -286,6 +303,20 @@ The benchmark shows where heavy traffic would break first. It's the **LLM provid
 
 The data APIs are a secondary bottleneck, handled by the cache and the rate limiters described above.
 
+### Performance under heavy load (estimate)
+These figures are **extrapolated from the benchmark, not load-tested**. With the default model, one question takes about **5 LLM calls and 15.5k tokens** (15k in, 0.55k out), about **8 s** end to end, and 3–5 data API calls. Required capacity scales linearly with the question rate:
+
+| Load (users each asking one question every 2 min) | Questions/min | LLM requests/min | LLM tokens/min | Data API calls/min |
+|---|---|---|---|---|
+| 10 | 5 | 25 | ~78k | ~20 |
+| 100 | 50 | 250 | ~780k | ~200 |
+| 1,000 | 500 | 2,500 | ~7.8M | ~2,000 |
+
+- **LLM:** **tokens per minute** is the figure to size provider contracts by. Even 10 users need ten times Groq's free tier. Every cache hit removes a whole question from these numbers.
+- **Latency:** about 8 s per question, almost entirely 5 sequential LLM round trips plus API calls. Our own compute (alignment, statistics, cross-validated linear and 200-tree forest models) takes about a second (measured in the Execution Log). Latency doesn't grow with load as long as provider quotas aren't reached; beyond that, requests queue or fail with 429.
+- **Our side:** each run mostly waits on I/O, so one async worker can handle many concurrent runs. The PoC's single Streamlit process with in-memory sessions was only tested with one user; the architecture above (queue, stateless workers, external state) removes that limit.
+- **Data APIs:** at 1,000 users and without caching, Open-Meteo calls (≈ 500–1,000/min, 1–2 per question) exceed the free tier's 600/min and need the commercial plan. Wikimedia's documented ceiling (~12,000/min) is not reached.
+
 ### Compliance & security (EU)
 **GDPR**
 - The open data itself (weather, aggregated pageviews, economic series) contains no personal data. But **user questions, chat history, logs and traces can**, so they fall under the GDPR.
@@ -337,3 +368,9 @@ These are known, documented weak spots. The code was frozen for the benchmark, s
 - **Data coverage.** English Wikipedia is read worldwide, so local questions work better with a local-language edition. Pollen data covers only Europe. FRED is mostly US data. ERA5 weather lags real time by about 5 days.
 - **Wikipedia views are a proxy for interest,** not for sales, illness or behaviour. The agent is told to label proxies as such.
 - **Local inference** on a CPU-only laptop takes minutes per question. Ollama is the offline option, Gemini the default.
+- **The assignment's example question** ("weather vs. flight delays *today*") is out of scope. No free API with flight-delay history was found (OpenSky has no delay data), and the system works on daily data, so intraday "today" questions aren't supported. Tested: the agent says the data isn't available and suggests a related question it can answer.
+- **Single-process PoC:** sessions live in memory, are lost on restart, and the app is not multi-instance (see *Scaling to production*).
+
+**Testing**
+- Unit tests cover the API clients (mocked HTTP), the analysis (synthetic data) and the tools (stubbed clients). **The agent loop itself has no automated test with a scripted LLM**; the benchmark acts as the integration test instead.
+- **No load test** was performed. The heavy-load figures above are estimates.
